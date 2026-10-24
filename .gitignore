@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Erzeugte Dateien der Skills (Spielstand-Kopien, Importdateien, Berichte)
+*/ausgabe/*
+!*/ausgabe/.gitkeep
+*/sicherung/
+
+# Persönliche Daten – werden beim ersten Lauf erzeugt
+anno117-spielstand/inselnamen.json
+anno117-spielstand/einstellungen.json
+
+# Spielstände und Spieldaten nie einchecken
+*.save
+*.a8s
+*.a7s
+*.rda
+
+# Editor und System
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
