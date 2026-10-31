@@ -5,6 +5,7 @@ Sammlung von Skills für [Claude Code](https://claude.com/claude-code). Jeder Un
 | Skill | Zweck |
 |---|---|
 | [anno117-spielstand](anno117-spielstand/) | Anno-117-Spielstände lesen und bearbeiten |
+| [claude-code-sandbox](claude-code-sandbox/) | Claude Code unter einem eingeschränkten Windows-Nutzer betreiben |
 
 ## Einbinden
 
