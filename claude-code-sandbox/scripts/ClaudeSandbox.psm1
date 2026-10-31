@@ -14,6 +14,10 @@ $script:SparedDeny = '(DE,RC,WDAC,WO,RD,WD,AD,REA,WEA,DC,WA)'
 $script:WindowsOwnNames = @('PerfLogs', 'Recovery', 'Boot', '$Recycle.Bin', 'System Volume Information', '$WinREAgent', '$SysReset', '$Windows.~BT', '$Windows.~WS', 'Config.Msi', 'Windows.old', 'OneDriveTemp')
 $script:WindowsOwnFiles = @('pagefile.sys', 'swapfile.sys', 'hiberfil.sys', 'bootmgr', 'BOOTNXT', 'BOOTSECT.BAK', 'DumpStack.log', 'DumpStack.log.tmp')
 $script:LogPath = $null
+$script:RepositoryUrl = 'https://github.com/EvilPingu/skills.git'
+$script:RepositoryRawBase = 'https://raw.githubusercontent.com/EvilPingu/skills/main/claude-code-sandbox/scripts/'
+# The files that make up the version. A new script has to be added here, which changes the hash as well.
+$script:SandboxFiles = @('ClaudeSandbox.psm1', 'Grant-ClaudeSandboxPath.ps1', 'Install-ClaudeSandbox.ps1', 'Invoke-ClaudeSandboxProbe.ps1', 'Show-ClaudeStatus.ps1', 'Start-ClaudeTerminal.ps1', 'Uninstall-ClaudeSandbox.ps1', 'Update-ClaudeSandbox.ps1')
 
 # ---------------------------------------------------------------------------------------------
 # Bootstrap functions (also used from Windows PowerShell 5.1)
@@ -287,6 +291,182 @@ function Get-SandboxPathPlan {
         }
     }
     return @{ Actions = @($actions); Parents = @($parents) }
+}
+
+function Get-SandboxGrantConflict {
+    <#
+    .SYNOPSIS
+    Checks a new release against existing ones. Returns Reason (refused) and Absorb (releases that the new
+    writable folder replaces). A release below a writable folder is refused or absorbed, never kept: the target
+    user could swap a folder on its path for a junction, and later runs would set permissions through it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('Read', 'Write')][string]$Access,
+        [AllowEmptyCollection()][string[]]$AllowPaths = @(),
+        [AllowEmptyCollection()][string[]]$WritePaths = @(),
+        [string]$GitPath,
+        [string]$ClaudePath
+    )
+    foreach ($base in @($GitPath, $ClaudePath) + @($WritePaths) | Where-Object { $_ }) {
+        if (Test-SandboxSamePath -Left $Path -Right $base) { continue }
+        if (Test-SandboxPathWithin -Path $Path -Base $base) { return @{ Reason = "'$Path' is inside '$base', which the target user can already write to."; Absorb = @() } }
+    }
+    if ($Access -eq 'Read') { return @{ Reason = $null; Absorb = @() } }
+    foreach ($fixed in @($GitPath, $ClaudePath) | Where-Object { $_ }) {
+        if (Test-SandboxPathWithin -Path $fixed -Base $Path) {
+            return @{ Reason = "'$Path' contains '$fixed'. Read access works here, read and write would let the target user swap that folder. Use -Access Read or release the folders next to it."; Absorb = @() }
+        }
+    }
+    $absorb = @(@($AllowPaths) + @($WritePaths) | Where-Object {
+        $_ -and -not (Test-SandboxSamePath -Left $_ -Right $Path) -and (Test-SandboxPathWithin -Path $_ -Base $Path)
+    })
+    return @{ Reason = $null; Absorb = $absorb }
+}
+
+function Get-SandboxRemovalProblem {
+    # A folder inside a release that stays keeps its access through inheritance, removing it would change nothing.
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [AllowEmptyCollection()][string[]]$Removing = @(),
+        [AllowEmptyCollection()][string[]]$AllowPaths = @(),
+        [AllowEmptyCollection()][string[]]$WritePaths = @(),
+        [string]$GitPath,
+        [string]$ClaudePath
+    )
+    foreach ($base in @($GitPath, $ClaudePath) + @($AllowPaths) + @($WritePaths) | Where-Object { $_ }) {
+        if (Test-SandboxSamePath -Left $base -Right $Path) { continue }
+        if (-not (Test-SandboxPathWithin -Path $Path -Base $base)) { continue }
+        if (@($Removing | Where-Object { Test-SandboxSamePath -Left $_ -Right $base }).Count -gt 0) { continue }
+        return "'$Path' is inside the release '$base' and would stay accessible through it. Single subfolders of a release cannot be locked. Remove '$base' and release the folders you want next to it."
+    }
+    return $null
+}
+
+function ConvertTo-SandboxNormalizedBytes {
+    # Git may store LF while a Windows clone has CRLF, and a BOM can differ as well. Neither is a real change.
+    param([byte[]]$Bytes)
+    $start = 0
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) { $start = 3 }
+    $stream = [IO.MemoryStream]::new($Bytes.Length)
+    for ($i = $start; $i -lt $Bytes.Length; $i++) {
+        if ($Bytes[$i] -eq 0x0D -and ($i + 1) -lt $Bytes.Length -and $Bytes[$i + 1] -eq 0x0A) { continue }
+        $stream.WriteByte($Bytes[$i])
+    }
+    return ,$stream.ToArray()
+}
+
+function Get-SandboxContentHash {
+    # File hashes are combined in a fixed order. $null content means the file is missing.
+    param([Parameter(Mandatory)][hashtable]$Contents)
+    $lines = foreach ($name in $script:SandboxFiles) {
+        $content = $Contents[$name]
+        if ($null -eq $content) { "$name missing"; continue }
+        $normalized = ConvertTo-SandboxNormalizedBytes -Bytes $content
+        "$name " + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$normalized))
+    }
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))))
+}
+
+function Get-SandboxScriptHash {
+    # Identifies the scripts in a folder. Every change to any of them changes this value.
+    param([Parameter(Mandatory)][string]$ScriptRoot)
+    $contents = @{}
+    foreach ($name in $script:SandboxFiles) {
+        $path = Join-Path $ScriptRoot $name
+        if (Test-Path -LiteralPath $path) { $contents[$name] = [IO.File]::ReadAllBytes($path) }
+    }
+    return (Get-SandboxContentHash -Contents $contents)
+}
+
+function Get-SandboxRepositoryHash {
+    <#
+    .SYNOPSIS
+    Hash of the scripts on the public main branch, or $null when the check is not possible.
+    The downloads are only hashed, nothing from them is parsed or executed. A file that is gone there (404)
+    counts as missing, which correctly gives a different hash.
+    #>
+    param([int]$TimeoutSeconds = 5, [string]$BaseUrl = $script:RepositoryRawBase)
+    $client = [Net.Http.HttpClient]::new()
+    $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+    try {
+        $contents = @{}
+        foreach ($name in $script:SandboxFiles) {
+            $response = $client.GetAsync($BaseUrl + $name).GetAwaiter().GetResult()
+            try {
+                if ($response.StatusCode -eq [Net.HttpStatusCode]::NotFound) { continue }
+                if (-not $response.IsSuccessStatusCode) { return $null }
+                $contents[$name] = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+            } finally { $response.Dispose() }
+        }
+        return (Get-SandboxContentHash -Contents $contents)
+    } catch {
+        return $null
+    } finally { $client.Dispose() }
+}
+
+function Get-SandboxShortHash {
+    param([string]$Hash)
+    if (-not $Hash) { return 'unknown' }
+    return $Hash.Substring(0, [Math]::Min(12, $Hash.Length)).ToLowerInvariant()
+}
+
+function Get-SandboxVersionAdvice {
+    <#
+    .SYNOPSIS
+    Compares the running scripts with the public repository and with the installation.
+    A hash cannot tell which side is newer. So the running scripts count as current only if they match the
+    repository. In every other mismatch with the installation NeedsConfirmation is set: older scripts do not know
+    settings of a newer installation, such as later releases, and could lose them.
+    #>
+    param([Parameter(Mandatory)][string]$Running, [string]$Repository, [string]$Installed)
+    $messages = [Collections.Generic.List[string]]::new()
+    $short = Get-SandboxShortHash -Hash $Running
+    $outdated = $false
+    $confirm = $false
+    if ($Repository -and $Repository -ne $Running) {
+        $outdated = $true
+        $messages.Add("These scripts ($short) differ from the public repository ($(Get-SandboxShortHash -Hash $Repository)). They may be older or have local changes.")
+    }
+    if ($Installed -and $Installed -ne $Running) {
+        if ($Repository -eq $Running) {
+            $messages.Add("The installation ($(Get-SandboxShortHash -Hash $Installed)) differs from these scripts, which match the repository. An installation run brings everything up to date.")
+        } else {
+            $outdated = $true
+            $confirm = $true
+            $messages.Add("These scripts ($short) differ from the installation ($(Get-SandboxShortHash -Hash $Installed)). If they are older, they do not know its settings and could damage them.")
+        }
+    }
+    return @{ Outdated = $outdated; NeedsConfirmation = $confirm; Messages = @($messages) }
+}
+
+function Get-SandboxUpdateInstructions {
+    # Never starts git or downloads code itself: running fetched code as administrator is what this avoids.
+    param([string]$ScriptRoot)
+    $clone = '<your clone>'
+    if ($ScriptRoot) {
+        $candidate = Split-Path -Parent (Split-Path -Parent $ScriptRoot)
+        if ($candidate -and (Test-Path -LiteralPath (Join-Path $candidate '.git') -ErrorAction SilentlyContinue)) { $clone = $candidate }
+    }
+    return @(
+        'How to update:',
+        "  1. In a normal terminal: git -C `"$clone`" pull",
+        "     Without a clone: git clone $script:RepositoryUrl",
+        '  2. Start Install-ClaudeSandbox.ps1 from that clone, not from %ProgramData%\ClaudeSandbox\install, as shown in the README.',
+        '     Your settings and releases are kept. It offers to copy the new scripts to the install folder.'
+    )
+}
+
+function Test-SandboxVersionAllowed {
+    # Reports a mismatch and how to fix it. Returns $false if the user should not continue.
+    param([string]$Installed, [Parameter(Mandatory)][string]$ScriptRoot)
+    $advice = Get-SandboxVersionAdvice -Running (Get-SandboxScriptHash -ScriptRoot $ScriptRoot) -Repository (Get-SandboxRepositoryHash) -Installed $Installed
+    foreach ($message in $advice.Messages) { Write-Host "WARNING: $message" -ForegroundColor Yellow }
+    if ($advice.Outdated) {
+        foreach ($line in Get-SandboxUpdateInstructions -ScriptRoot $ScriptRoot) { Write-Host $line -ForegroundColor Yellow }
+    }
+    if ($advice.NeedsConfirmation) { return (Read-SandboxYesNo -Prompt 'Continue with these scripts anyway?') }
+    return $true
 }
 
 function New-SandboxPassword {
@@ -870,6 +1050,7 @@ function Get-SandboxModel {
     }
     if ($Config.ClaudePath) { $grants.Add(@{ Path = $Config.ClaudePath; Rights = 'F'; Kind = 'Claude' }) }
     if ($Config.GitPath) { $grants.Add(@{ Path = $Config.GitPath; Rights = 'M'; Kind = 'Git' }) }
+    foreach ($path in @($Config.WritePaths) | Where-Object { $_ }) { $grants.Add(@{ Path = $path; Rights = 'M'; Kind = 'Write' }) }
     foreach ($path in @($Config.AllowPaths) + @($Config.Toolchains) | Where-Object { $_ } | Select-Object -Unique) {
         $grants.Add(@{ Path = $path; Rights = 'RX'; Kind = 'Allow' })
     }
@@ -1259,6 +1440,26 @@ function Invoke-SandboxVolumeScan {
     if ($scan.WriteErrors -gt 0) { $status = 'Incomplete' }
     elseif ($scan.Unreadable -gt 0) { $status = 'ProtectedWithExceptions' }
     return @{ Status = $status; Unreadable = $scan.Unreadable; WriteErrors = $scan.WriteErrors; Objects = $scan.Objects }
+}
+
+function Get-SandboxSkippedScanStatus {
+    # -SkipAclScan keeps a clean result of an earlier check. Without one the volume really is unverified.
+    param([hashtable]$Entry, [bool]$ProtectionOk)
+    if (-not $ProtectionOk) { return 'Incomplete' }
+    if ($Entry -and $Entry.LastScanStatus -in 'Protected', 'ProtectedWithExceptions') { return $Entry.LastScanStatus }
+    return 'Unverified'
+}
+
+function Invoke-SandboxPathCheck {
+    # Phase 2 for one folder that lost its release, including the folder itself. Returns the number of write errors.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][hashtable]$Config, [Parameter(Mandatory)][hashtable]$Model, [Parameter(Mandatory)][hashtable]$Layout)
+    if (-not (Test-Path -LiteralPath $Path)) { return 0 }
+    $prefix = Join-Path $Layout.LogDir ('path-' + [guid]::NewGuid().ToString('N'))
+    $scan = Invoke-SandboxTreeScan -Roots @($Path) -Sid $Config.TargetSid -TokenSids @($Config.TokenSids) -Model $Model -LogPrefix $prefix -Label "Checking every object below $Path"
+    $single = @{ Sid = $Config.TargetSid; TokenSids = @($Config.TokenSids); Unreadable = 0; WriteErrors = 0; Denied = 0; Objects = 0; UnreadableLog = "$prefix.unreadable.log"; OwnerLog = "$prefix.owner.log" }
+    # With a release left below it the folder is a parent and already has its rules. A full deny would cut that release off.
+    if (-not $Model.Parents.Contains($Path.TrimEnd('\'))) { Invoke-SandboxScanItem -Item (Get-Item -LiteralPath $Path -Force) -Scan $single }
+    return ($scan.WriteErrors + $single.WriteErrors)
 }
 
 function Set-SandboxVolumeStatus {

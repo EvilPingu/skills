@@ -45,9 +45,15 @@ For repeat runs and uninstalling, use the copy in `%ProgramData%\ClaudeSandbox\i
 | `-Volumes` | Only these volumes, separated by `;`. Saved, and the tasks respect it |
 | `-AllowPath` | Extra read access, separated by `;` |
 | `-RemoveAllowPath` | Takes back an `-AllowPath`, separated by `;` |
-| `-SkipAclScan` | Skips checking every object, the status stays `Unverified` |
+| `-SkipAclScan` | Skips checking every object on a repeat run and keeps the last result, see below |
 | `-AclTestOnly` | Trial run, see below |
 | `-WhatIf` | Lists the steps only. This does not test any permission |
+
+**Repeat run without the long check.** `-SkipAclScan` still sets grants, locks and everything else, it only skips checking every object. A volume keeps the status of its last check, and the exit code stays `0` if that was clean. Use it when only something like a new version or a changed setting has to be applied.
+
+- A volume without an earlier check becomes `Unverified`, exit code `1`.
+- A folder that just lost its release is always checked, because it may still hold files of the target user.
+- An allow set later deep inside a locked tree stays undetected until a run without this switch. The first run and repeat runs after larger changes should not use it.
 
 Lists use `;` because `pwsh -File` passes `a,b` as one string.
 
@@ -62,6 +68,112 @@ Show the stored password in your own terminal, not in Claude:
 ```powershell
 & "$env:LOCALAPPDATA\ClaudeSandbox\Start-ClaudeTerminal.ps1" -ShowPassword
 ```
+
+## Updates
+
+Install, Grant and Uninstall compare a hash over all scripts with the public repository and with what is installed. There is no version number to maintain, every change counts. Line endings and a BOM are ignored, so a Windows clone matches the repository. The files from `https://github.com/EvilPingu/skills` are only hashed. Nothing from them is run, because that would be fetched code with administrator rights. Without network that part of the check is skipped silently.
+
+| Situation | What happens |
+|---|---|
+| The scripts differ from the repository | A warning with the steps below, the script continues. They may be older or have local changes |
+| The scripts match the repository, the installation differs | A note. An installation run brings everything up to date |
+| The scripts differ from both, or the repository cannot be reached and the installation differs | A warning and a question, default No. A hash cannot tell which is newer, and older scripts do not know newer settings, such as later releases, and could lose them |
+
+To update, in a normal terminal:
+
+```powershell
+git -C "<Repo>" pull
+```
+
+Without a clone: `git clone https://github.com/EvilPingu/skills.git`. Then start `Install-ClaudeSandbox.ps1` from the clone as shown under [Install](#install), not from `%ProgramData%\ClaudeSandbox\install\`, which holds the old scripts. Your settings and releases are kept, and the script offers to copy the new ones to the install folder. Add `-SkipAclScan` if only the scripts changed. Installations from before this check show their hash as `unknown` until the next run.
+
+## Release more folders later
+
+`Grant-ClaudeSandboxPath.ps1` adds or removes single folders without a full installation run. It applies at once, also in an open Claude terminal, and tests the result as the target user. Run it elevated from the account that did the installation. From the repository it offers to update `%ProgramData%\ClaudeSandbox\install\` first, which also brings the scheduled tasks up to date.
+
+```powershell
+Start-Process "$env:ProgramFiles\PowerShell\7\pwsh.exe" -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','"<Repo>\claude-code-sandbox\scripts\Grant-ClaudeSandboxPath.ps1"'
+```
+
+Without parameters it shows the current releases and asks for the folder and the access.
+
+**Examples.** Open an elevated terminal without your profile, as shown in the [trial run](#trial-run-on-a-vhdx), and set the script path once. The folder names are examples:
+
+```powershell
+$grant = "$env:ProgramData\ClaudeSandbox\install\Grant-ClaudeSandboxPath.ps1"
+```
+
+The copy in `install\` only has the script after a first start from the repository, or after an installation run with this version. The window waits for Enter after each call.
+
+Show what is released:
+
+```powershell
+& $grant -List
+```
+
+Let Claude read a tools folder:
+
+```powershell
+& $grant -Path 'D:\Tools' -Access Read
+```
+
+Let Claude work in two project folders. Several folders are separated by `;`:
+
+```powershell
+& $grant -Path 'D:\Projects\app;D:\Projects\web' -Access Write
+```
+
+Change a read release to read and write, or back. Name the same folder again:
+
+```powershell
+& $grant -Path 'D:\Tools' -Access Write
+& $grant -Path 'D:\Tools' -Access Read
+```
+
+Let Claude read everything below a parent of your Git folder, for example `E:\work` with the Git folder `E:\work\git`. The Git folder stays writable:
+
+```powershell
+& $grant -Path 'E:\work' -Access Read
+```
+
+Replace two releases with their common parent. The script lists both and asks before they become part of it:
+
+```powershell
+& $grant -Path 'D:\Projects' -Access Write
+```
+
+Lock a folder again. A release inside it stays reachable:
+
+```powershell
+& $grant -Path 'D:\Tools' -Remove
+```
+
+Lock one subfolder of a release, for example `D:\Projects\private`. Remove the outer release first, then release the folders next to it:
+
+```powershell
+& $grant -Path 'D:\Projects' -Remove
+& $grant -Path 'D:\Projects\app;D:\Projects\web' -Access Write
+```
+
+Preview a change without applying it:
+
+```powershell
+& $grant -Path 'D:\Tools' -Access Write -WhatIf
+```
+
+The same checks as in the installation apply: no volume roots, no Windows folders, no profiles of other accounts, and `Write` not below `AppData` in your own profile. A folder inside your own profile needs a confirmation. `-Access Write` makes a folder a writable tree like the Git folder: administrator and SYSTEM do not change anything below its top folder afterwards. `-Remove` takes back such a release and locks the folder again, including a check of every object in it. It only works for folders released this way, or with `-AllowPath`. The Git and `claude` folders change with a new installation run.
+
+**Folders that contain or sit inside other releases:**
+
+| Case | Result |
+|---|---|
+| `Read` on a parent of the Git folder or another release | Allowed. The whole tree becomes readable, the folders inside keep their rights |
+| `Write` on a parent of a read or write release | Allowed after a confirmation. The folders inside become part of it and lose their own entry |
+| `Write` on a parent of the Git or `claude` folder | Refused. The target user could swap those folders. Use `Read`, or release the folders next to them |
+| `-Remove` on a parent | The parent is locked again, a release inside stays reachable and the parent can be traversed but not listed |
+| `-Remove` on a folder inside a release that stays | Refused, it would stay reachable through the outer release. Single subfolders of a release cannot be locked |
+
+To lock a subfolder of a release: remove the outer release, then release the folders you want next to the locked one.
 
 ## Trial run on a VHDX
 

@@ -19,6 +19,7 @@ description: Set up, check or remove a restricted Windows account that runs Clau
 | Path | Purpose |
 |---|---|
 | `scripts/Install-ClaudeSandbox.ps1` | Installation, repeat runs, `-AllowPath`, `-RemoveAllowPath`, `-AclTestOnly` |
+| `scripts/Grant-ClaudeSandboxPath.ps1` | Release more folders later or take a release back, read or read and write, without a full run |
 | `scripts/Uninstall-ClaudeSandbox.ps1` | Removal, also of a trial run with `-AclTestOnly` |
 | `scripts/Update-ClaudeSandbox.ps1` | Scheduled follow-up as SYSTEM, modes `Check`, `Root`, `Scan` |
 | `scripts/Start-ClaudeTerminal.ps1` | Starter behind the desktop link, copied to `%LOCALAPPDATA%\ClaudeSandbox` |
@@ -34,6 +35,7 @@ description: Set up, check or remove a restricted Windows account that runs Clau
 
 ## Editing the scripts
 
+- The version check hashes the files in `$script:SandboxFiles` in `ClaudeSandbox.psm1`. Add every new script to that list.
 - All output, names and comments stay in English. Never read text from external tools, only exit codes, SIDs and objects.
 - Never use `icacls /T` or `GetFiles` with `AllDirectories`: both walk through junctions. Every `icacls` call goes through `Invoke-SandboxIcacls`.
 - Never start anything through PATH from an elevated or SYSTEM process.

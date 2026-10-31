@@ -83,6 +83,8 @@ if (Test-SandboxLocationWritable -Path $PSScriptRoot -Sids $writerSids) {
     }
 }
 
+if (-not (Test-SandboxVersionAllowed -Installed $config.InstalledHash -ScriptRoot $PSScriptRoot)) { Stop-WithError 'Stopped: update the scripts first.' }
+
 $targetSid = $config.TargetSid
 $allVolumes = @(Get-SandboxVolumes)
 $selection = if ($AclTestOnly) { Resolve-SandboxVolumeSelection -Requested @(Split-SandboxList -Value $Volumes) -Volumes $allVolumes } else { $config.VolumeKeys }
@@ -123,7 +125,7 @@ try {
     $model = Get-SandboxModel -Config $config -Volumes $allVolumes
     # Git and Claude folders stay writable for the target until here: only their top folder is changed.
     $writableTrees = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($path in @($config.ClaudePath, $config.GitPath) | Where-Object { $_ }) { $null = $writableTrees.Add($path.TrimEnd('\')) }
+    foreach ($path in @($config.ClaudePath, $config.GitPath) + @($config.WritePaths) | Where-Object { $_ }) { $null = $writableTrees.Add($path.TrimEnd('\')) }
     foreach ($path in $writableTrees) {
         if (Test-Path -LiteralPath $path) { $null = Invoke-SandboxIcacls -Path $path -Operation @('/remove', "*$targetSid") }
     }

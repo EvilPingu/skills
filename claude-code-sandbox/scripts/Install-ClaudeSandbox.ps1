@@ -146,6 +146,10 @@ if ($locationAction -eq 'RestartInstall') {
     }
 }
 
+$installedConfig = Read-SandboxJson -Path $layout.ConfigPath
+$installedHash = if ($installedConfig) { $installedConfig.InstalledHash }
+if (-not (Test-SandboxVersionAllowed -Installed $installedHash -ScriptRoot $PSScriptRoot)) { Stop-WithError 'Stopped: update the scripts first.' }
+
 if ($isWhatIf) {
     Write-Host 'What if: the script would run these steps. This does not test any ACL, use -AclTestOnly on a VHDX for that.'
     $steps = if ($AclTestOnly) {
@@ -316,8 +320,21 @@ $main = {
         if (@($allowFinal | Where-Object { Test-SandboxSamePath -Left $_ -Right $value }).Count -eq 0) { $allowFinal.Add($value) }
     }
 
-    $priorPaths = @(@(if ($prior) { @($prior.GitPath, $prior.ClaudePath) + @($prior.AllowPaths) }) | Where-Object { $_ })
-    $currentPaths = @(@($finalGit, $claudePath) + @($allowFinal) | Where-Object { $_ })
+    # Folders released later with Grant-ClaudeSandboxPath.ps1 survive a repeat run.
+    $writeFinal = [Collections.Generic.List[string]]::new()
+    foreach ($stored in @(if ($prior) { $prior.WritePaths })) {
+        if (-not $stored -or @($removed | Where-Object { Test-SandboxSamePath -Left $_ -Right $stored }).Count -gt 0) { continue }
+        $writeFinal.Add((& $checkPath -Path $stored -Kind Git -Stored $stored -CurrentClaude $claudePath))
+    }
+
+    foreach ($item in $allowFinal) {
+        foreach ($writable in $writeFinal) {
+            if (Test-SandboxPathWithin -Path $item -Base $writable) { Stop-WithError "-AllowPath '$item' is inside '$writable', which the target user can already write to." }
+        }
+    }
+
+    $priorPaths = @(@(if ($prior) { @($prior.GitPath, $prior.ClaudePath) + @($prior.AllowPaths) + @($prior.WritePaths) }) | Where-Object { $_ })
+    $currentPaths = @(@($finalGit, $claudePath) + @($allowFinal) + @($writeFinal) | Where-Object { $_ })
     $abandonedPaths = @($priorPaths | Where-Object { $old = $_; @($currentPaths | Where-Object { Test-SandboxSamePath -Left $_ -Right $old }).Count -eq 0 })
     $newlyGranted = @($currentPaths | Where-Object { $new = $_; @($priorPaths | Where-Object { Test-SandboxSamePath -Left $_ -Right $new }).Count -eq 0 })
 
@@ -446,9 +463,9 @@ $main = {
     $uniqueToolchains = @($toolchains | Select-Object -Unique)
 
     $config = @{
-        Version = 1; Test = [bool]$AclTestOnly; UserName = $UserName; TargetSid = $targetSid; TokenSids = $tokenSids
+        Version = 1; InstalledHash = (Get-SandboxScriptHash -ScriptRoot $PSScriptRoot); Test = [bool]$AclTestOnly; UserName = $UserName; TargetSid = $targetSid; TokenSids = $tokenSids
         ExecutorSid = $executorSid; ExecutorProfile = $executorProfile; TargetProfile = $targetProfile
-        ClaudePath = $claudePath; GitPath = $finalGit; AllowPaths = @($allowFinal); Toolchains = $uniqueToolchains
+        ClaudePath = $claudePath; GitPath = $finalGit; AllowPaths = @($allowFinal); WritePaths = @($writeFinal); Toolchains = $uniqueToolchains
         VolumeKeys = $volumeKeys; FirewallVerified = $false; PwshPath = $machinePwsh
     }
     Write-SandboxJson -Path $layout.ConfigPath -Value $config
@@ -481,7 +498,7 @@ $main = {
         $null = [IO.Directory]::CreateDirectory($finalGit)
         $null = Invoke-SandboxIcacls -Path $finalGit -Operation @('/grant', "*${executorSid}:(OI)(CI)(M)")
     }
-    foreach ($writable in @($claudePath, $finalGit) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) {
+    foreach ($writable in @($claudePath, $finalGit) + @($writeFinal) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) {
         # Read-only look, no reparse points followed. Admin and SYSTEM never change anything below the top folder.
         $pending = [Collections.Generic.Queue[object]]::new()
         $pending.Enqueue(@($writable, 0))
@@ -531,7 +548,19 @@ $main = {
             $protection = Set-SandboxVolumeProtection -Config $config -Model $model -Volume $volume -Volumes $volumeList -Layout $layout
             if (-not $protection.Ok) { Add-ReportWarning "$($volume.MountPath): some permissions could not be set." }
             if ($SkipAclScan) {
-                Set-SandboxVolumeStatus -Layout $layout -Volume $volume -Status $(if ($protection.Ok) { 'Unverified' } else { 'Incomplete' })
+                $lastState = Read-SandboxJson -Path $layout.StatePath
+                $lastEntry = if ($lastState -and $lastState.Volumes) { $lastState.Volumes[$volume.Key] }
+                $skipStatus = Get-SandboxSkippedScanStatus -Entry $lastEntry -ProtectionOk $protection.Ok
+                # Folders that just lost their release cannot wait: they may still hold files of the target user.
+                foreach ($old in $abandonedPaths) {
+                    $oldVolume = Get-SandboxVolumeOfPath -Path $old -Volumes $volumeList
+                    if (-not $oldVolume -or $oldVolume.Key -ne $volume.Key) { continue }
+                    Write-SandboxMessage -Message "Checking $old, it lost its release"
+                    if ((Invoke-SandboxPathCheck -Path $old -Config $config -Model $model -Layout $layout) -gt 0) { $skipStatus = 'Incomplete' }
+                }
+                Set-SandboxVolumeStatus -Layout $layout -Volume $volume -Status $skipStatus
+                if ($skipStatus -eq 'Unverified') { Add-ReportWarning "$($volume.MountPath): the check was skipped and there is no earlier result." }
+                elseif ($lastEntry -and $lastEntry.LastScanUtc) { Write-SandboxMessage -Message "Volume $($volume.MountPath): check skipped, keeping $skipStatus from $($lastEntry.LastScanUtc)." }
                 continue
             }
             Set-SandboxVolumeStatus -Layout $layout -Volume $volume -Status 'Incomplete'
@@ -717,6 +746,7 @@ $main = {
         }
     }
     foreach ($path in $allowFinal) { if (Test-Path -LiteralPath $path) { & $addTest "Release is readable: $path" 'ListDirectory' $path 'Allowed' } }
+    foreach ($path in $writeFinal) { if (Test-Path -LiteralPath $path) { & $addTest "Release is writable: $path" 'WriteFile' $path 'Allowed' } }
     foreach ($parent in $model.Parents) {
         if (-not (Test-Path -LiteralPath $parent)) { continue }
         & $addTest "Parent is not listable: $parent" 'ListDirectory' $parent 'Denied'
