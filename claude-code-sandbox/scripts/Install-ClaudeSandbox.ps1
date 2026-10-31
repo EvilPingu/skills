@@ -195,8 +195,12 @@ $main = {
     # ---- Step 4: prerequisites --------------------------------------------------------------------
     Write-SandboxMessage -Level Step -Message 'Checking prerequisites'
     $service = Get-Service -Name seclogon
-    if ($service.StartType -eq 'Disabled') { Set-Service -Name seclogon -StartupType Manual }
+    if ($service.StartType -eq 'Disabled') {
+        Set-Service -Name seclogon -StartupType Manual
+        Write-SandboxResult -Status Changed -Message 'Secondary Logon service was disabled, set to manual start.'
+    }
     if ($service.Status -ne 'Running') { Start-Service -Name seclogon }
+    if ($service.StartType -ne 'Disabled') { Write-SandboxResult -Status Unchanged -Message 'Secondary Logon service is available.' }
 
     $gitRoot = $null
     if (-not $AclTestOnly) {
@@ -219,6 +223,9 @@ $main = {
             $code = Invoke-SandboxQuietProcess -FilePath $winget -Activity 'Installing Git' -ArgumentList @('install', '--id', 'Git.Git', '--exact', '--scope', 'machine', '--silent', '--accept-package-agreements', '--accept-source-agreements')
             $gitRoot = & $findGit
             if (-not $gitRoot) { Stop-WithError "Git could not be installed (winget exit code $code). Install Git for Windows for all users: https://git-scm.com/downloads/win" }
+            Write-SandboxResult -Status Changed -Message "Git installed for all users at $gitRoot."
+        } else {
+            Write-SandboxResult -Status Unchanged -Message "Git is already installed at $gitRoot."
         }
         if (-not (Test-Path -LiteralPath (Join-Path $gitRoot 'bin\bash.exe'))) { Stop-WithError "bin\bash.exe is missing in $gitRoot. Repair the Git for Windows installation." }
     }
@@ -380,6 +387,7 @@ $main = {
     Write-SandboxMessage -Level Step -Message "Setting up user '$UserName'"
     $credentialPath = Join-Path $localFolder 'credential.xml'
     $password = $null
+    $passwordFileCurrent = $false
     $isKnownTestUser = $false
     if ($AclTestOnly -and $existingUser) {
         $testConfig = Read-SandboxJson -Path $layout.ConfigPath
@@ -389,20 +397,31 @@ $main = {
         $password = New-SandboxPassword
         $existingUser = New-LocalUser -Name $UserName -Password $password -PasswordNeverExpires -UserMayNotChangePassword -AccountNeverExpires -Description 'Restricted account for Claude Code'
         Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $existingUser.SID.Value -ErrorAction SilentlyContinue
+        Write-SandboxResult -Status Changed -Message "User '$UserName' created with a new random password."
     } elseif ($isKnownTestUser) {
         $password = New-SandboxPassword
         Set-LocalUser -SID $existingUser.SID.Value -Password $password
+        Write-SandboxResult -Status Changed -Message "Test user '$UserName' already existed, it got a new random password."
     } else {
+        Write-SandboxResult -Status Unchanged -Message "User '$UserName' already exists, it was not created."
         if (-not $AclTestOnly -and (Test-Path -LiteralPath $credentialPath)) {
             try {
                 $stored = Import-Clixml -LiteralPath $credentialPath
-                if (Test-SandboxLogon -UserName $UserName -Password $stored.Password) { $password = $stored.Password }
+                if (Test-SandboxLogon -UserName $UserName -Password $stored.Password) {
+                    $password = $stored.Password
+                    $passwordFileCurrent = $true
+                    Write-SandboxResult -Status Unchanged -Message 'The stored password is still valid.'
+                }
             } catch { Write-SandboxMessage -Level Warn -Message 'The stored password could not be read.' }
         }
         for ($attempt = 1; -not $password -and $attempt -le 3 -and (Test-SandboxInteractive); $attempt++) {
             $entered = Read-Host "Password of '$UserName' (attempt $attempt of 3)" -AsSecureString
-            if (Test-SandboxLogon -UserName $UserName -Password $entered) { $password = $entered }
-            else { Write-SandboxMessage -Level Warn -Message 'The password was not accepted.' }
+            if (Test-SandboxLogon -UserName $UserName -Password $entered) {
+                $password = $entered
+                Write-SandboxResult -Status Unchanged -Message 'The password you entered is valid, it was not changed.'
+            } else {
+                Write-SandboxMessage -Level Warn -Message 'The password was not accepted.'
+            }
         }
         if (-not $password) {
             if ($AclTestOnly) { Stop-WithError 'The password of the test user is unknown. Use a new test user name.' }
@@ -410,22 +429,46 @@ $main = {
             if (-not (Read-SandboxYesNo -Prompt 'Reset the password to a new random one?')) { Stop-WithError 'Stopped: the password of the target user is unknown.' }
             $password = New-SandboxPassword
             Set-LocalUser -SID $existingUser.SID.Value -Password $password
+            Write-SandboxResult -Status Changed -Message "The password of '$UserName' was reset to a new random one."
         }
     }
     $targetSid = $existingUser.SID.Value
-    if (-not $existingUser.Enabled) { Enable-LocalUser -SID $targetSid }
-    Set-LocalUser -SID $targetSid -PasswordNeverExpires $true -UserMayChangePassword $false
+    if (-not $existingUser.Enabled) {
+        Enable-LocalUser -SID $targetSid
+        Write-SandboxResult -Status Changed -Message "User '$UserName' was disabled and is now enabled."
+    }
+    $accountNow = Get-LocalUser -SID $targetSid
+    if ($accountNow.PasswordExpires -or $accountNow.UserMayChangePassword) {
+        Set-LocalUser -SID $targetSid -PasswordNeverExpires $true -UserMayChangePassword $false
+        Write-SandboxResult -Status Changed -Message 'The password now never expires and the user cannot change it.'
+    } else {
+        Write-SandboxResult -Status Unchanged -Message 'The password already never expires and the user cannot change it.'
+    }
     $credential = [pscredential]::new($UserName, $password)
-    if (-not $AclTestOnly) { $credential | Export-Clixml -LiteralPath $credentialPath }
+    if (-not $AclTestOnly) {
+        if ($passwordFileCurrent) {
+            Write-SandboxResult -Status Unchanged -Message "The password file is up to date: $credentialPath"
+        } else {
+            $credential | Export-Clixml -LiteralPath $credentialPath
+            Write-SandboxResult -Status Changed -Message "Password stored for your account only: $credentialPath"
+        }
+    }
 
     # ---- Step 7: groups -----------------------------------------------------------------------------
     if (-not $AclTestOnly) {
-        foreach ($group in Get-SandboxUserGroups -UserSid $targetSid) {
+        $groupsBefore = @(Get-SandboxUserGroups -UserSid $targetSid)
+        foreach ($group in $groupsBefore) {
             if ($group.SID -eq 'S-1-5-32-545') { continue }
             Remove-LocalGroupMember -SID $group.SID -Member $targetSid
-            Add-ReportWarning "Removed '$UserName' from the group '$($group.Name)'."
+            Write-SandboxResult -Status Changed -Message "Removed '$UserName' from the group '$($group.Name)'."
         }
-        Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $targetSid -ErrorAction SilentlyContinue
+        if (@($groupsBefore | Where-Object { $_.SID -eq 'S-1-5-32-545' }).Count -eq 0) {
+            Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $targetSid -ErrorAction SilentlyContinue
+            Write-SandboxResult -Status Changed -Message "Added '$UserName' to the Users group."
+        }
+        if (@($groupsBefore | Where-Object { $_.SID -ne 'S-1-5-32-545' }).Count -eq 0 -and $groupsBefore.Count -gt 0) {
+            Write-SandboxResult -Status Unchanged -Message "'$UserName' is only in the Users group."
+        }
     }
     if (@(Get-SandboxUserGroups -UserSid $targetSid | Where-Object { $_.SID -eq 'S-1-5-32-544' }).Count -gt 0) { Stop-WithError "'$UserName' is still an administrator. Nothing further was changed." }
 
@@ -435,6 +478,8 @@ $main = {
     if ($probe.Sid -ne $targetSid) { Stop-WithError 'The probe did not run as the target user.' }
     if (Test-SandboxSamePath -Left $probe.Profile -Right $executorProfile) { Stop-WithError 'The target user did not get its own profile.' }
     $targetProfile = $probe.Profile
+    if ($existingProfile) { Write-SandboxResult -Status Unchanged -Message "The profile already exists: $targetProfile" }
+    else { Write-SandboxResult -Status Changed -Message "Profile created: $targetProfile" }
     $tokenSids = @(@($probe.Sid) + @($probe.Groups) | Select-Object -Unique)
 
     # ---- Step 9: toolchains ---------------------------------------------------------------------------
@@ -461,6 +506,12 @@ $main = {
         }
     }
     $uniqueToolchains = @($toolchains | Select-Object -Unique)
+    if (-not $AclTestOnly) {
+        $priorToolchains = @(if ($prior) { $prior.Toolchains })
+        $newToolchains = @($uniqueToolchains | Where-Object { $priorToolchains -notcontains $_ })
+        if ($newToolchains.Count -gt 0) { Write-SandboxResult -Status Changed -Message "Toolchains released: $($newToolchains -join ', ')" }
+        else { Write-SandboxResult -Status Unchanged -Message "No new toolchains, $($uniqueToolchains.Count) already known." }
+    }
 
     $config = @{
         Version = 1; InstalledHash = (Get-SandboxScriptHash -ScriptRoot $PSScriptRoot); Test = [bool]$AclTestOnly; UserName = $UserName; TargetSid = $targetSid; TokenSids = $tokenSids
@@ -476,7 +527,7 @@ $main = {
         if (Test-Path -LiteralPath $old) {
             # The allow goes first, so the tree is no longer writable when Phase 2 walks through it.
             $null = Invoke-SandboxIcacls -Path $old -Operation @('/remove:g', "*$targetSid")
-            Write-SandboxMessage -Message "Released access to $old."
+            Write-SandboxResult -Status Changed -Message "Access to $old was taken back."
         }
     }
     foreach ($new in $newlyGranted) {
@@ -491,12 +542,18 @@ $main = {
             $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]$sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
         }
         $null = [IO.FileSystemAclExtensions]::CreateDirectory($security, $claudePath)
+        Write-SandboxResult -Status Changed -Message "Claude folder created: $claudePath"
     } elseif ($claudePath) {
-        Add-ReportWarning "$claudePath already existed. Its other permissions were kept."
+        Write-SandboxResult -Status Unchanged -Message "Claude folder already exists: $claudePath"
+        # Only new to this installation: on a repeat run the folder is ours and this would just be noise.
+        if (-not (Test-SandboxSamePath -Left $oldClaude -Right $claudePath)) { Add-ReportWarning "$claudePath already existed. Its other permissions were kept." }
     }
     if ($createGit) {
         $null = [IO.Directory]::CreateDirectory($finalGit)
         $null = Invoke-SandboxIcacls -Path $finalGit -Operation @('/grant', "*${executorSid}:(OI)(CI)(M)")
+        Write-SandboxResult -Status Changed -Message "Git folder created: $finalGit"
+    } elseif ($finalGit) {
+        Write-SandboxResult -Status Unchanged -Message "Git folder already exists: $finalGit"
     }
     foreach ($writable in @($claudePath, $finalGit) + @($writeFinal) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) {
         # Read-only look, no reparse points followed. Admin and SYSTEM never change anything below the top folder.
@@ -545,8 +602,12 @@ $main = {
             if (-not $volumeLock) { Stop-WithError "The volume $($volume.MountPath) is locked by a running task." }
             $locks.Add($volumeLock)
             Write-SandboxMessage -Message "Volume $($volume.MountPath): setting the deny and the releases"
+            $changesBefore = Get-SandboxAclChangeCount
             $protection = Set-SandboxVolumeProtection -Config $config -Model $model -Volume $volume -Volumes $volumeList -Layout $layout
             if (-not $protection.Ok) { Add-ReportWarning "$($volume.MountPath): some permissions could not be set." }
+            $ruleChanges = (Get-SandboxAclChangeCount) - $changesBefore
+            if ($ruleChanges -gt 0) { Write-SandboxResult -Status Changed -Message "$($volume.MountPath): $ruleChanges permission entries set or changed." }
+            else { Write-SandboxResult -Status Unchanged -Message "$($volume.MountPath): locks and releases were already in place." }
             if ($SkipAclScan) {
                 $lastState = Read-SandboxJson -Path $layout.StatePath
                 $lastEntry = if ($lastState -and $lastState.Volumes) { $lastState.Volumes[$volume.Key] }
@@ -560,12 +621,16 @@ $main = {
                 }
                 Set-SandboxVolumeStatus -Layout $layout -Volume $volume -Status $skipStatus
                 if ($skipStatus -eq 'Unverified') { Add-ReportWarning "$($volume.MountPath): the check was skipped and there is no earlier result." }
-                elseif ($lastEntry -and $lastEntry.LastScanUtc) { Write-SandboxMessage -Message "Volume $($volume.MountPath): check skipped, keeping $skipStatus from $($lastEntry.LastScanUtc)." }
+                elseif ($lastEntry -and $lastEntry.LastScanUtc) { Write-SandboxResult -Status Skipped -Message "$($volume.MountPath): check of every object skipped, keeping $skipStatus from $($lastEntry.LastScanUtc)." }
                 continue
             }
             Set-SandboxVolumeStatus -Layout $layout -Volume $volume -Status 'Incomplete'
             Write-SandboxMessage -Message "Volume $($volume.MountPath): checking every object"
+            $changesBefore = Get-SandboxAclChangeCount
             $scan = Invoke-SandboxVolumeScan -Config $config -Model $model -Volume $volume -Layout $layout -Targets $protection.Targets
+            $scanChanges = (Get-SandboxAclChangeCount) - $changesBefore
+            if ($scanChanges -gt 0) { Write-SandboxResult -Status Changed -Message "$($volume.MountPath): $scanChanges corrections on single objects." }
+            else { Write-SandboxResult -Status Unchanged -Message "$($volume.MountPath): no object needed a correction." }
             $status = $scan.Status
             if (-not $protection.Ok) { $status = 'Incomplete' }
             Set-SandboxVolumeStatus -Layout $layout -Volume $volume -Status $status -Scan $scan
@@ -620,12 +685,14 @@ $main = {
         # ---- Step 12 and 13: removable storage, PATH, Claude ------------------------------------------
         Write-SandboxMessage -Level Step -Message 'Blocking removable storage and installing Claude if needed'
         $current = Invoke-SandboxProbe -Credential $credential -PwshPath $machinePwsh -Layout $realLayout
+        if ($current.ClaudePath) { Write-SandboxResult -Status Unchanged -Message "Claude is already available for the target user: $($current.ClaudePath)" }
         if (-not $current.ClaudePath) {
             Write-SandboxMessage -Message 'Installing Claude for the target user...'
             $install = Invoke-SandboxUserProcess -Credential $credential -FilePath (Join-Path $machinePwsh 'pwsh.exe') -TimeoutSeconds 900 -ArgumentList @(
                 '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'irm https://claude.ai/install.ps1 | iex'
             )
             if ($install.ExitCode -ne 0) { Add-ReportWarning "The Claude installer ended with exit code $($install.ExitCode)."; $script:ExitCode = 1 }
+            else { Write-SandboxResult -Status Changed -Message 'Claude installed for the target user.' }
         }
         $localBin = '%USERPROFILE%\.local\bin'
         $entries = @($pathEntries) + $localBin
@@ -638,11 +705,24 @@ $main = {
             'NotInstalled' { Write-SandboxMessage -Message 'Windows Terminal is not installed, the link opens a plain console window.' }
             default { Add-ReportWarning 'Windows Terminal could not be registered for the target user, the link opens a plain console window. Signing in once with that account usually registers it.' }
         }
+        # A retry after a vanished hive must not forget what the first attempt already changed.
+        $hiveResult = @{ PolicySet = $false; PathAdded = [Collections.Generic.List[string]]::new() }
         $hiveOk = Invoke-SandboxWithUserHive -Sid $targetSid -ProfilePath $targetProfile -Action {
             param($hive)
             $policy = $hive.CreateSubKey('Software\Policies\Microsoft\Windows\RemovableStorageDevices')
-            try { $policy.SetValue('Deny_All', 1, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $policy.Dispose() }
-            Set-SandboxUserPathEntries -Root $hive -Entries $entries
+            try {
+                if ($policy.GetValue('Deny_All') -ne 1) {
+                    $policy.SetValue('Deny_All', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+                    $hiveResult.PolicySet = $true
+                }
+            } finally { $policy.Dispose() }
+            foreach ($added in @(Set-SandboxUserPathEntries -Root $hive -Entries $entries)) { $hiveResult.PathAdded.Add($added) }
+        }
+        if ($hiveOk) {
+            if ($hiveResult.PolicySet) { Write-SandboxResult -Status Changed -Message 'Removable storage is now blocked for the target user.' }
+            else { Write-SandboxResult -Status Unchanged -Message 'Removable storage was already blocked for the target user.' }
+            if ($hiveResult.PathAdded.Count -gt 0) { Write-SandboxResult -Status Changed -Message "Added to the PATH of the target user: $($hiveResult.PathAdded -join ', ')" }
+            else { Write-SandboxResult -Status Unchanged -Message 'The PATH of the target user already has all entries.' }
         }
         if (-not $hiveOk) { Add-ReportWarning 'The registry of the target user could not be loaded: removable storage is not blocked and PATH was not extended. Run the script again.'; $script:ExitCode = 1 }
 
@@ -660,33 +740,57 @@ $main = {
         $asTarget = { param([string[]]$Arguments) (Invoke-SandboxUserProcess -Credential $credential -FilePath $gitExe -ArgumentList $Arguments -WorkingDirectory $targetProfile).ExitCode }
         foreach ($value in $safeValues) {
             if ((& $asTarget @('config', '--global', '--fixed-value', '--get-all', 'safe.directory', $value)) -ne 0) {
-                $null = & $asTarget @('config', '--global', '--add', 'safe.directory', $value)
+                if ((& $asTarget @('config', '--global', '--add', 'safe.directory', $value)) -eq 0) { Write-SandboxResult -Status Changed -Message "The target user trusts $value in Git." }
+                else { Add-ReportWarning "Git safe.directory could not be set for $value."; $script:ExitCode = 1 }
+            } else {
+                Write-SandboxResult -Status Unchanged -Message "The target user already trusts $value in Git."
             }
         }
-        if ($gitName -and (& $asTarget @('config', '--global', '--get', 'user.name')) -ne 0) { $null = & $asTarget @('config', '--global', 'user.name', $gitName) }
-        if ($gitEmail -and (& $asTarget @('config', '--global', '--get', 'user.email')) -ne 0) { $null = & $asTarget @('config', '--global', 'user.email', $gitEmail) }
+        foreach ($identity in @(@('user.name', $gitName), @('user.email', $gitEmail))) {
+            $setting, $wanted = $identity
+            if ((& $asTarget @('config', '--global', '--get', $setting)) -eq 0) {
+                Write-SandboxResult -Status Unchanged -Message "Git $setting of the target user is already set, it was kept."
+            } elseif ($wanted) {
+                $null = & $asTarget @('config', '--global', $setting, $wanted)
+                Write-SandboxResult -Status Changed -Message "Git $setting of the target user set."
+            } else {
+                Write-SandboxResult -Status Skipped -Message "Git $setting of the target user is not set, no value was given."
+            }
+        }
         foreach ($repo in $trustRepos) {
             if ((Invoke-SandboxQuietProcess -FilePath $gitExe -ArgumentList @('config', '--global', '--fixed-value', '--get-all', 'safe.directory', $repo)) -ne 0) {
                 $null = Invoke-SandboxQuietProcess -FilePath $gitExe -ArgumentList @('config', '--global', '--add', 'safe.directory', $repo)
+                Write-SandboxResult -Status Changed -Message "Your account now trusts $repo in Git."
+            } else {
+                Write-SandboxResult -Status Unchanged -Message "Your account already trusts $repo in Git."
             }
         }
 
         # ---- Step 16: desktop link ----------------------------------------------------------------------
         Write-SandboxMessage -Level Step -Message 'Creating the desktop link'
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Show-ClaudeStatus.ps1') -Destination $realLayout.Root -Force
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Start-ClaudeTerminal.ps1') -Destination $localFolder -Force
+        $starterTarget = Join-Path $localFolder 'Start-ClaudeTerminal.ps1'
+        $starterSource = Join-Path $PSScriptRoot 'Start-ClaudeTerminal.ps1'
+        $starterSame = (Test-Path -LiteralPath $starterTarget) -and (Get-FileHash -LiteralPath $starterTarget).Hash -eq (Get-FileHash -LiteralPath $starterSource).Hash
+        Copy-Item -LiteralPath $starterSource -Destination $localFolder -Force
+        if ($starterSame) { Write-SandboxResult -Status Unchanged -Message 'The terminal starter is up to date.' }
+        else { Write-SandboxResult -Status Changed -Message "Terminal starter updated: $starterTarget" }
         Write-SandboxJson -Path (Join-Path $localFolder 'terminal.json') -Value @{
             ClaudePath = $claudePath; PwshPath = $machinePwsh; StatusScript = (Join-Path $realLayout.Root 'Show-ClaudeStatus.ps1')
         }
         $pwshExe = Join-Path $machinePwsh 'pwsh.exe'
         $shell = New-Object -ComObject WScript.Shell
-        $link = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'Claude Terminal.lnk'))
+        $linkPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Claude Terminal.lnk'
+        $linkExisted = Test-Path -LiteralPath $linkPath
+        $link = $shell.CreateShortcut($linkPath)
         $link.TargetPath = $pwshExe
         $link.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $localFolder 'Start-ClaudeTerminal.ps1')`""
         $link.WorkingDirectory = $localFolder
         $link.IconLocation = "$pwshExe,0"
         $link.Description = "Terminal as $UserName in $claudePath"
         $link.Save()
+        if ($linkExisted) { Write-SandboxResult -Status Unchanged -Message "The desktop link already exists, its settings were refreshed: $linkPath" }
+        else { Write-SandboxResult -Status Changed -Message "Desktop link created: $linkPath" }
 
         # ---- Step 17: firewall and tasks ----------------------------------------------------------------
         Write-SandboxMessage -Level Step -Message 'Testing the firewall block and registering the tasks'
@@ -705,16 +809,23 @@ $main = {
         if ($firewallStatus -eq 'Passed') {
             $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
             $programs = Get-SandboxClaudeBlockPaths -ExecutorProfile $executorProfile -UserPathValue $userPath
-            Sync-SandboxFirewallRules -ExecutorSid $executorSid -Programs $programs
-            Write-SandboxMessage -Level Ok -Message "Firewall block set for $(@($programs).Count) Claude paths, only for your account."
+            $firewall = Sync-SandboxFirewallRules -ExecutorSid $executorSid -Programs $programs
+            if ($firewall.Added -gt 0 -or $firewall.Removed -gt 0) { Write-SandboxResult -Status Changed -Message "Firewall block for your account: $($firewall.Added) rules added, $($firewall.Removed) removed, $($firewall.Kept) kept." }
+            else { Write-SandboxResult -Status Unchanged -Message "Firewall block for your account: all $($firewall.Kept) rules were already in place." }
         } else {
             Add-ReportWarning "The firewall block for your account is NOT set: $firewallStatus. Run the script again to repeat the test."
             if ($script:ExitCode -eq 0) { $script:ExitCode = 2 }
         }
+        $tasksBefore = @(Get-ScheduledTask -TaskName 'ClaudeSandbox-*' -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -ne 'ClaudeSandbox-Test' }).Count
         Register-SandboxTasks -PwshPath $machinePwsh -Layout $realLayout
+        if ($tasksBefore -ge 3) { Write-SandboxResult -Status Unchanged -Message 'The scheduled tasks already exist, their settings were refreshed.' }
+        else { Write-SandboxResult -Status Changed -Message 'Scheduled tasks registered: Check, Root and Scan.' }
 
         if ($deleteShadowCopies) {
             foreach ($copy in Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction SilentlyContinue) { Remove-CimInstance -InputObject $copy -ErrorAction SilentlyContinue }
+            $shadowLeft = @(Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction SilentlyContinue).Count
+            if ($shadowLeft -eq 0) { Write-SandboxResult -Status Changed -Message "All $shadowCount shadow copies deleted." }
+            else { Add-ReportWarning "$shadowLeft of $shadowCount shadow copies could not be deleted." }
         }
     }
 
@@ -806,6 +917,14 @@ $main = {
         if ($entry.Status -in 'Locked', 'NoAcls') { $gaps = $true }
     }
     if ($gaps -and $script:ExitCode -eq 0) { $script:ExitCode = 2 }
+    $changes = @(Get-SandboxChangedResults | Where-Object { $_ })
+    Write-Host ''
+    if ($changes.Count -gt 0) {
+        Write-Host "Changed in this run ($($changes.Count)):" -ForegroundColor Green
+        foreach ($change in $changes) { Write-Host " - $change" -ForegroundColor Green }
+    } else {
+        Write-Host 'Nothing had to be changed in this run.' -ForegroundColor Green
+    }
     if ($script:Warnings.Count -gt 0) {
         Write-Host ''
         Write-Host "Warnings ($($script:Warnings.Count)):" -ForegroundColor Yellow

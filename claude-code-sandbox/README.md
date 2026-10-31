@@ -35,6 +35,18 @@ Start-Process "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -
 
 The script asks for the volume of the `claude` folder and for your Git folder. All questions come before the long phases. Checking every object on a large volume can take hours, progress stays visible, and an interrupted run can simply be repeated. The window waits for Enter at the end and shows the exit code and log path.
 
+Below each step the script says what really happened, and at the end it lists everything that changed in this run:
+
+```text
+== Setting up user 'claude-code'
+   unchanged  User 'claude-code' already exists, it was not created.
+   unchanged  The stored password is still valid.
+== Creating the desktop link
+   changed    Desktop link created: C:\Users\you\Desktop\Claude Terminal.lnk
+```
+
+`changed` means the script changed something, `unchanged` that it was already in place, `skipped` that it was left out, such as the check of every object with `-SkipAclScan`.
+
 For repeat runs and uninstalling, use the copy in `%ProgramData%\ClaudeSandbox\install\`.
 
 | Parameter | Meaning |

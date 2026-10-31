@@ -43,7 +43,7 @@ function Invoke-CheckMode {
     if ($config.Test) {
         Write-SandboxMessage -LogOnly -Message ("Test mode, Claude paths found: " + ($programs -join '; '))
     } elseif ($config.FirewallVerified) {
-        Sync-SandboxFirewallRules -ExecutorSid $config.ExecutorSid -Programs $programs
+        $null = Sync-SandboxFirewallRules -ExecutorSid $config.ExecutorSid -Programs $programs
     }
 
     $volumes = @(Get-SandboxVolumes)
