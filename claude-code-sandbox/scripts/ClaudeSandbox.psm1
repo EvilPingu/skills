@@ -15,7 +15,7 @@ $script:WindowsOwnNames = @('PerfLogs', 'Recovery', 'Boot', '$Recycle.Bin', 'Sys
 $script:WindowsOwnFiles = @('pagefile.sys', 'swapfile.sys', 'hiberfil.sys', 'bootmgr', 'BOOTNXT', 'BOOTSECT.BAK', 'DumpStack.log', 'DumpStack.log.tmp')
 $script:LogPath = $null
 $script:RepositoryUrl = 'https://github.com/EvilPingu/skills.git'
-$script:RepositoryRawBase = 'https://raw.githubusercontent.com/EvilPingu/skills/main/claude-code-sandbox/scripts/'
+$script:RepositoryRawCommitBase = 'https://raw.githubusercontent.com/EvilPingu/skills/{0}/claude-code-sandbox/scripts/'
 # The files that make up the version. A new script has to be added here, which changes the hash as well.
 $script:SandboxFiles = @('ClaudeSandbox.psm1', 'Grant-ClaudeSandboxPath.ps1', 'Install-ClaudeSandbox.ps1', 'Invoke-ClaudeSandboxProbe.ps1', 'Show-ClaudeStatus.ps1', 'Start-ClaudeTerminal.ps1', 'Uninstall-ClaudeSandbox.ps1', 'Update-ClaudeSandbox.ps1')
 
@@ -379,6 +379,16 @@ function Get-SandboxScriptHash {
     return (Get-SandboxContentHash -Contents $contents)
 }
 
+function Get-SandboxCommitFromRefs {
+    # Only a 40 digit hex value is taken from the answer, it ends up in a download address.
+    # No word boundary in front: in this protocol a four digit length field comes directly before the hash.
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    $match = [regex]::Match($Text, '([0-9a-f]{40}) refs/heads/main(?=[\s\x00]|$)')
+    if (-not $match.Success) { return $null }
+    return $match.Groups[1].Value
+}
+
 function Get-SandboxRepositoryHash {
     <#
     .SYNOPSIS
@@ -386,10 +396,18 @@ function Get-SandboxRepositoryHash {
     The downloads are only hashed, nothing from them is parsed or executed. A file that is gone there (404)
     counts as missing, which correctly gives a different hash.
     #>
-    param([int]$TimeoutSeconds = 5, [string]$BaseUrl = $script:RepositoryRawBase)
+    param([int]$TimeoutSeconds = 5, [string]$BaseUrl)
     $client = [Net.Http.HttpClient]::new()
     $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
     try {
+        if (-not $BaseUrl) {
+            # The raw host caches a branch for minutes, which would report a false mismatch right after a merge.
+            # A commit address is never stale. Without it the check is not reliable, so it is skipped.
+            $refs = $client.GetStringAsync($script:RepositoryUrl + '/info/refs?service=git-upload-pack').GetAwaiter().GetResult()
+            $commit = Get-SandboxCommitFromRefs -Text $refs
+            if (-not $commit) { return $null }
+            $BaseUrl = $script:RepositoryRawCommitBase -f $commit
+        }
         $contents = @{}
         foreach ($name in $script:SandboxFiles) {
             $response = $client.GetAsync($BaseUrl + $name).GetAwaiter().GetResult()
