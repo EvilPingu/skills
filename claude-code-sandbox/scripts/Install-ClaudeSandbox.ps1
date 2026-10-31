@@ -611,9 +611,9 @@ $main = {
         }
         $hiveOk = Invoke-SandboxWithUserHive -Sid $targetSid -ProfilePath $targetProfile -Action {
             param($hive)
-            $policy = [Microsoft.Win32.Registry]::Users.CreateSubKey("$hive\Software\Policies\Microsoft\Windows\RemovableStorageDevices")
+            $policy = $hive.CreateSubKey('Software\Policies\Microsoft\Windows\RemovableStorageDevices')
             try { $policy.SetValue('Deny_All', 1, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $policy.Dispose() }
-            Set-SandboxUserPathEntries -HiveName $hive -Entries $entries
+            Set-SandboxUserPathEntries -Root $hive -Entries $entries
         }
         if (-not $hiveOk) { Add-ReportWarning 'The registry of the target user could not be loaded: removable storage is not blocked and PATH was not extended. Run the script again.'; $script:ExitCode = 1 }
 

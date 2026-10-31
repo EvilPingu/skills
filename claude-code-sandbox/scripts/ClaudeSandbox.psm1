@@ -1465,39 +1465,48 @@ function Get-SandboxInteractiveOwners {
 function Invoke-SandboxWithUserHive {
     <#
     .SYNOPSIS
-    Runs a script block with the target user's registry hive, loading it if needed. The block gets the
-    HKEY_USERS subkey name. Returns $false if the hive could not be loaded.
+    Runs a script block with an open, writable key of the target user's registry hive, loading the hive if
+    needed. Returns $false if that keeps failing.
+    The block gets a RegistryKey, never a name: Windows unloads the hive shortly after the user's last process
+    ended, and a name-based create below HKEY_USERS then fails with ERROR_INVALID_PARAMETER. The open handle
+    keeps the hive in place, and the retry covers the moment it disappears. The block must be idempotent.
     #>
-    param([Parameter(Mandatory)][string]$Sid, [Parameter(Mandatory)][string]$ProfilePath, [Parameter(Mandatory)][scriptblock]$Action)
-    $loaded = [Microsoft.Win32.Registry]::Users.OpenSubKey($Sid)
-    if ($loaded) {
-        $loaded.Dispose()
-        & $Action $Sid
-        return $true
-    }
+    param([Parameter(Mandatory)][string]$Sid, [Parameter(Mandatory)][string]$ProfilePath, [Parameter(Mandatory)][scriptblock]$Action, [int]$Attempts = 6, [int]$DelaySeconds = 5)
     $mount = "ClaudeSandbox_$($Sid -replace '-', '_')"
     $hive = Join-Path $ProfilePath 'NTUSER.DAT'
     $reg = Get-SandboxSystemTool 'reg.exe'
-    $ready = $false
-    for ($attempt = 0; $attempt -lt 6 -and -not $ready; $attempt++) {
-        if ((Invoke-SandboxQuietProcess -FilePath $reg -ArgumentList @('load', "HKU\$mount", $hive)) -eq 0) { $ready = $true }
-        else { Start-Sleep -Seconds 5 }
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if ($attempt -gt 1) { Start-Sleep -Seconds $DelaySeconds }
+        $root = $null
+        $mounted = $false
+        try {
+            $root = [Microsoft.Win32.Registry]::Users.OpenSubKey($Sid, $true)
+            if (-not $root) {
+                if ((Invoke-SandboxQuietProcess -FilePath $reg -ArgumentList @('load', "HKU\$mount", $hive)) -ne 0) { continue }
+                $mounted = $true
+                $root = [Microsoft.Win32.Registry]::Users.OpenSubKey($mount, $true)
+                if (-not $root) { continue }
+            }
+            $null = & $Action $root
+            return $true
+        } catch {
+            Write-SandboxMessage -LogOnly -Level Warn -Message "Registry attempt $attempt of ${Attempts}: $($_.Exception.GetBaseException().GetType().Name)"
+        } finally {
+            if ($root) { $root.Dispose() }
+            if ($mounted) {
+                [GC]::Collect()
+                [GC]::WaitForPendingFinalizers()
+                $null = Invoke-SandboxQuietProcess -FilePath $reg -ArgumentList @('unload', "HKU\$mount")
+            }
+        }
     }
-    if (-not $ready) { return $false }
-    try {
-        & $Action $mount
-        return $true
-    } finally {
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
-        $null = Invoke-SandboxQuietProcess -FilePath $reg -ArgumentList @('unload', "HKU\$mount")
-    }
+    return $false
 }
 
 function Set-SandboxUserPathEntries {
     # Appends entries to the target user's PATH and keeps the value expandable.
-    param([Parameter(Mandatory)][string]$HiveName, [Parameter(Mandatory)][string[]]$Entries)
-    $key = [Microsoft.Win32.Registry]::Users.CreateSubKey("$HiveName\Environment")
+    param([Parameter(Mandatory)][Microsoft.Win32.RegistryKey]$Root, [Parameter(Mandatory)][string[]]$Entries)
+    $key = $Root.CreateSubKey('Environment')
     try {
         $current = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         $parts = [Collections.Generic.List[string]]::new()

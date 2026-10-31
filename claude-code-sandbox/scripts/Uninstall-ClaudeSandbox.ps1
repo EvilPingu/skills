@@ -182,7 +182,7 @@ try {
         Get-NetFirewallRule -Group (Get-SandboxFirewallGroup) -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
         $hiveOk = Invoke-SandboxWithUserHive -Sid $targetSid -ProfilePath $config.TargetProfile -Action {
             param($hive)
-            $policy = [Microsoft.Win32.Registry]::Users.OpenSubKey("$hive\Software\Policies\Microsoft\Windows\RemovableStorageDevices", $true)
+            $policy = $hive.OpenSubKey('Software\Policies\Microsoft\Windows\RemovableStorageDevices', $true)
             if ($policy) { try { $policy.DeleteValue('Deny_All', $false) } finally { $policy.Dispose() } }
         }
         if (-not $hiveOk) { Write-Host 'WARNING: The removable storage policy of the target user could not be removed.' -ForegroundColor Yellow; $exitCode = 2 }
