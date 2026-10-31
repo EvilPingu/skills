@@ -160,6 +160,32 @@ function Write-SandboxMessage {
     Write-Host ($prefix + $Message) -ForegroundColor $color
 }
 
+function Write-SandboxResult {
+    <#
+    .SYNOPSIS
+    Reports what a step really did: Changed, Unchanged or Skipped. Changes are kept for the summary at the end.
+    Callers decide the status from a check, never from the fact that the step ran.
+    #>
+    param([Parameter(Mandatory)][ValidateSet('Changed', 'Unchanged', 'Skipped')][string]$Status, [Parameter(Mandatory)][string]$Message)
+    $label = @{ Changed = 'changed'; Unchanged = 'unchanged'; Skipped = 'skipped' }[$Status]
+    $color = @{ Changed = 'Green'; Unchanged = 'DarkGray'; Skipped = 'Yellow' }[$Status]
+    Write-SandboxMessage -LogOnly -Message "$label`: $Message"
+    Write-Host ('   {0,-10} {1}' -f $label, $Message) -ForegroundColor $color
+    if ($Status -eq 'Changed') {
+        if (-not $script:ChangedResults) { $script:ChangedResults = [Collections.Generic.List[string]]::new() }
+        $script:ChangedResults.Add($Message)
+    }
+}
+
+function Get-SandboxChangedResults {
+    return @($script:ChangedResults)
+}
+
+function Get-SandboxAclChangeCount {
+    # Successful icacls writes so far. All icacls calls change something, reading goes through Get-Acl.
+    return [int]$script:AclChangeCount
+}
+
 function Test-SandboxInteractive {
     return ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected)
 }
@@ -666,9 +692,12 @@ function Get-SandboxSystemTool {
 
 function Invoke-SandboxIcacls {
     # Every call carries /L and never /T: icacls /T walks through junctions.
+    # Never /C either: with it icacls returns exit code 0 even when access is denied, so a failed lock looks fine.
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$Operation, [string]$Activity)
-    $arguments = @($Path, '/L') + $Operation + @('/C', '/Q')
-    return (Invoke-SandboxQuietProcess -FilePath (Get-SandboxSystemTool 'icacls.exe') -ArgumentList $arguments -Activity $Activity)
+    $arguments = @($Path, '/L') + $Operation + @('/Q')
+    $exitCode = Invoke-SandboxQuietProcess -FilePath (Get-SandboxSystemTool 'icacls.exe') -ArgumentList $arguments -Activity $Activity
+    if ($exitCode -eq 0) { $script:AclChangeCount = [int]$script:AclChangeCount + 1 }
+    return $exitCode
 }
 
 function Invoke-SandboxUserProcess {
@@ -1561,18 +1590,27 @@ function New-SandboxFirewallRule {
 }
 
 function Sync-SandboxFirewallRules {
-    # Adds missing rules and removes rules of version files that no longer exist.
+    # Adds missing rules and removes rules of version files that no longer exist. Returns how many of each.
     param([Parameter(Mandatory)][string]$ExecutorSid, [Parameter(Mandatory)][string[]]$Programs)
     $wanted = [Collections.Generic.HashSet[string]]::new([string[]]$Programs, [StringComparer]::OrdinalIgnoreCase)
     $existing = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $added = 0
+    $removed = 0
     foreach ($rule in Get-NetFirewallRule -Group $script:FirewallGroup -ErrorAction SilentlyContinue) {
         $program = (Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule).Program
         if ($wanted.Contains($program)) { $null = $existing.Add($program) }
-        else { Remove-NetFirewallRule -InputObject $rule -ErrorAction SilentlyContinue }
+        else {
+            Remove-NetFirewallRule -InputObject $rule -ErrorAction SilentlyContinue
+            $removed++
+        }
     }
     foreach ($program in $Programs) {
-        if (-not $existing.Contains($program)) { New-SandboxFirewallRule -Program $program -ExecutorSid $ExecutorSid }
+        if (-not $existing.Contains($program)) {
+            New-SandboxFirewallRule -Program $program -ExecutorSid $ExecutorSid
+            $added++
+        }
     }
+    return @{ Added = $added; Removed = $removed; Kept = $existing.Count }
 }
 
 function Test-SandboxFirewallEnabled {
@@ -1723,17 +1761,22 @@ function Invoke-SandboxWithUserHive {
 }
 
 function Set-SandboxUserPathEntries {
-    # Appends entries to the target user's PATH and keeps the value expandable.
+    # Appends entries to the target user's PATH and keeps the value expandable. Returns the entries it added.
     param([Parameter(Mandatory)][Microsoft.Win32.RegistryKey]$Root, [Parameter(Mandatory)][string[]]$Entries)
     $key = $Root.CreateSubKey('Environment')
     try {
         $current = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         $parts = [Collections.Generic.List[string]]::new()
         foreach ($part in $current -split ';') { if ($part) { $parts.Add($part) } }
+        $added = [Collections.Generic.List[string]]::new()
         foreach ($entry in $Entries) {
-            if (@($parts | Where-Object { Test-SandboxSamePath -Left $_ -Right $entry }).Count -eq 0) { $parts.Add($entry) }
+            if (@($parts | Where-Object { Test-SandboxSamePath -Left $_ -Right $entry }).Count -eq 0) {
+                $parts.Add($entry)
+                $added.Add($entry)
+            }
         }
-        $key.SetValue('Path', ($parts -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        if ($added.Count -gt 0) { $key.SetValue('Path', ($parts -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString) }
+        return @($added)
     } finally { $key.Dispose() }
 }
 
